@@ -116,6 +116,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   private val configIdToDownloadId = mutableMapOf<String, Long>()
   private val configIdToProgressFuture = mutableMapOf<String, Future<OnProgressState?>>()
   private val configIdToHeaders = mutableMapOf<String, Map<String, String>>()
+  private val configIdToTempPath = mutableMapOf<String, String>()
   private lateinit var ee: DeviceEventManagerModule.RCTDeviceEventEmitter
 
   // Centralized progress reporting with threshold filtering and batching
@@ -664,9 +665,13 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       storageManager.getBooleanSync("allowsCellularAccess", true)
     }
     // Use global notification setting instead of per-task setting
-    val isNotificationVisible = UIDTDownloadJobService.isNotificationsEnabled()
+    val isNotificationVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        UIDTDownloadJobService.isNotificationsEnabled()
+    } else {
+      false
+    }
 
-    // Get maxRedirects parameter
+      // Get maxRedirects parameter
     var maxRedirects = 0
     if (options.hasKey("maxRedirects")) {
       maxRedirects = options.getInt("maxRedirects")
@@ -723,6 +728,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
          externalFilesDir.absolutePath.startsWith("/sdcard/") ||
          externalFilesDir.absolutePath.startsWith("/mnt/"))
 
+    val tempExternalPath = File(externalFilesDir, filename).absolutePath
+
     // Save headers for potential pause/resume functionality
     val headersMap = HeaderUtils.toMap(headers)
     val metadataValue = metadata ?: "{}"
@@ -739,6 +746,7 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
         configIdToDownloadId[id] = downloadId
         configIdToHeaders[id] = headersMap
         configIdToMetadata[id] = metadataValue
+        configIdToTempPath[id] = tempExternalPath
         downloadIdToConfig[downloadId] = config
         saveDownloadIdToConfigMap()
         resumeTasks(downloadId, config)
@@ -759,18 +767,10 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
       downloader.startResumableDownload(id, url, destination, headersMap, resumableDownloadListener, metadataValue)
     }
 
-    // On Android 16+ (API 36), DownloadManager has strict path restrictions and throws
-    // SecurityException for app-specific external storage paths. Use ResumableDownloader instead.
-    if (Build.VERSION.SDK_INT >= 36) {
-      logD(NAME, "Android 16+ detected: Using ResumableDownloader to avoid DownloadManager path restrictions")
-      startWithResumableDownloader()
-      return
-    }
-
     if (isValidExternalPath) {
       // Use DownloadManager with valid external storage path
       // Download directly to final destination to avoid file duplication
-      val destFile = File(destination)
+      val destFile = File(tempExternalPath)
       val parentDir = destFile.parentFile
       if (parentDir != null && !parentDir.exists()) {
         parentDir.mkdirs()
@@ -939,11 +939,13 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     }
 
     try {
-      // Currently this method doesn't have any implementation on Android
-      // as completion handlers are handled differently than iOS.
-      // This defensive structure ensures Firebase Performance compatibility.
-      logD(NAME, "completeHandler executed successfully for configId: $configId")
+      // Remove from DownloadManager's database so it doesn't reappear in queries
+      val downloadId = configIdToDownloadId[configId]
+      if (downloadId != null) {
+        downloader.downloadManager.remove(downloadId)
+      }
 
+      logD(NAME, "completeHandler executed successfully for configId: $configId")
     } catch (e: Exception) {
       // Catch any potential exceptions that might be thrown due to Firebase Performance
       // bytecode instrumentation interfering with method dispatch
@@ -1121,9 +1123,27 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     @Suppress("UNUSED_VARIABLE")
     val localUri = downloadStatus.getString("localUri")
 
-    // File is already at the final destination - no need to move it
-    // Verify it exists at the expected location
+    val tempPath = configIdToTempPath.remove(config.id)
     val destinationFile = File(config.destination)
+
+    if (tempPath != null && tempPath != config.destination) {
+      val tempFile = File(tempPath)
+      destinationFile.parentFile?.mkdirs()
+
+      val moved = tempFile.renameTo(destinationFile)
+      if (!moved) {
+        // renameTo fails across filesystems, fall back to copy+delete
+        try {
+          tempFile.copyTo(destinationFile, overwrite = true)
+          tempFile.delete()
+        } catch (e: Exception) {
+          logE(NAME, "Failed to move temp file to destination: ${e.message}")
+          eventEmitter.emitFailed(config.id, "Failed to move file to destination", -1)
+          return
+        }
+      }
+    }
+
     if (!destinationFile.exists()) {
       logE(NAME, "Downloaded file not found at destination: ${config.destination}")
       val newDownloadStatus = Arguments.createMap()
