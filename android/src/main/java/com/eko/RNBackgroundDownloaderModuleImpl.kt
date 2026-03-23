@@ -30,6 +30,12 @@ import java.net.URL
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicationContext) {
 
@@ -117,6 +123,12 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   private val configIdToProgressFuture = mutableMapOf<String, Future<OnProgressState?>>()
   private val configIdToHeaders = mutableMapOf<String, Map<String, String>>()
   private val configIdToTempPath = mutableMapOf<String, String>()
+
+  // Coroutine scope for offloading file I/O work from the main thread.
+  // SupervisorJob ensures one failed child doesn't cancel the others.
+  // Tied to the module lifecycle — cancelled in invalidate().
+  private val moduleScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
   private lateinit var ee: DeviceEventManagerModule.RCTDeviceEventEmitter
 
   // Centralized progress reporting with threshold filtering and batching
@@ -340,6 +352,8 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
   }
 
   fun invalidate() {
+    // Cancel the module coroutine scope to stop any in-flight file I/O
+    moduleScope.cancel()
     // Cancel all download notifications when app is closed
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       // Cancel notifications for all known downloads
@@ -387,31 +401,54 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
           val status = downloadStatus.getInt("status")
           val localUri = downloadStatus.getString("localUri")
 
+          // Extract all values from WritableMap synchronously on the main thread,
+          // before any async handoff. WritableMap is not thread-safe and must not
+          // be read from a background coroutine.
+          val downloadIdStr = downloadStatus.getString("downloadId")
+          val bytesDownloaded = downloadStatus.getDouble("bytesDownloaded").toLong()
+          val bytesTotal = downloadStatus.getDouble("bytesTotal").toLong()
+          val reason = downloadStatus.getInt("reason")
+          val reasonText = downloadStatus.getString("reasonText")
+
           stopTaskProgress(config.id)
 
           synchronized(sharedLock) {
             // Drop any buffered progress that slipped past stopTaskProgress's clearPendingReport
             // (the polling thread may have re-added it between clearPendingReport and this lock)
             progressReporter.clearPendingReport(config.id)
-            when (status) {
-              DownloadManager.STATUS_SUCCESSFUL -> {
-                onSuccessfulDownload(config, downloadStatus)
-              }
-              DownloadManager.STATUS_FAILED -> {
-                onFailedDownload(config, downloadStatus)
-              }
-            }
+          }
 
-            if (localUri != null) {
-              // Prevent memory leaks from MediaScanner.
-              // Download successful, clean task after media scanning.
-              val paths = arrayOf(localUri)
-              MediaScannerConnection.scanFile(context, paths, null) { _, _ ->
-                stopTask(config.id)
+          // goAsync() extends the BroadcastReceiver's active window beyond onReceive().
+          // Without it, Android releases the wake lock when onReceive() returns, which
+          // could suspend the device mid-copy on a multi-GB file.
+          val pendingResult = goAsync()
+
+          moduleScope.launch {
+            try {
+              when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> {
+                  onSuccessfulDownload(config, bytesDownloaded, bytesTotal)
+                }
+                DownloadManager.STATUS_FAILED -> {
+                  onFailedDownload(config, downloadIdStr, reason, reasonText)
+                }
               }
-            } else {
-              // Download failed, clean task.
-              stopTask(config.id)
+
+              synchronized(sharedLock) {
+                if (localUri != null) {
+                  // Prevent memory leaks from MediaScanner.
+                  // Download successful, clean task after media scanning.
+                  val paths = arrayOf(localUri)
+                  MediaScannerConnection.scanFile(context, paths, null) { _, _ ->
+                    stopTask(config.id)
+                  }
+                } else {
+                  // Download failed, clean task.
+                  stopTask(config.id)
+                }
+              }
+            } finally {
+              pendingResult.finish()
             }
           }
         }
@@ -666,12 +703,12 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     }
     // Use global notification setting instead of per-task setting
     val isNotificationVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        UIDTDownloadJobService.isNotificationsEnabled()
+      UIDTDownloadJobService.isNotificationsEnabled()
     } else {
-      false
+      true
     }
 
-      // Get maxRedirects parameter
+    // Get maxRedirects parameter
     var maxRedirects = 0
     if (options.hasKey("maxRedirects")) {
       maxRedirects = options.getInt("maxRedirects")
@@ -692,13 +729,12 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     val request = DownloadManager.Request(Uri.parse(url))
     request.setAllowedOverRoaming(isAllowedOverRoaming)
     request.setAllowedOverMetered(isAllowedOverMetered)
+    request.setRequiresDeviceIdle(false)
+    request.setRequiresCharging(false)
     request.setNotificationVisibility(
       if (isNotificationVisible) DownloadManager.Request.VISIBILITY_VISIBLE
       else DownloadManager.Request.VISIBILITY_HIDDEN
     )
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-      request.setRequiresCharging(false)
-    }
 
     // Note: On Android 16+, we use ResumableDownloader with UIDT jobs instead of DownloadManager
     // for better background execution support. See the Android 16+ check below in download path.
@@ -724,9 +760,9 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     // Get external files directory and validate it's a proper external storage path
     val externalFilesDir = reactContext.getExternalFilesDir(null)
     val isValidExternalPath = externalFilesDir != null &&
-        (externalFilesDir.absolutePath.startsWith("/storage/") ||
-         externalFilesDir.absolutePath.startsWith("/sdcard/") ||
-         externalFilesDir.absolutePath.startsWith("/mnt/"))
+            (externalFilesDir.absolutePath.startsWith("/storage/") ||
+                    externalFilesDir.absolutePath.startsWith("/sdcard/") ||
+                    externalFilesDir.absolutePath.startsWith("/mnt/"))
 
     val tempExternalPath = File(externalFilesDir, filename).absolutePath
 
@@ -1119,78 +1155,79 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
     progressReporter.reportProgress(configId, bytesDownloaded, bytesTotal)
   }
 
-  private fun onSuccessfulDownload(config: RNBGDTaskConfig, downloadStatus: WritableMap) {
-    @Suppress("UNUSED_VARIABLE")
-    val localUri = downloadStatus.getString("localUri")
+  /**
+   * Moves [tempFile] to [destinationFile], first attempting a fast atomic rename.
+   * Falls back to copy+delete if rename fails (e.g. source and destination are on
+   * different filesystems). Returns true on success, false on failure.
+   * Must be called from a background thread / IO dispatcher.
+   */
+  private fun moveFile(tempFile: File, destinationFile: File): Boolean {
+    destinationFile.parentFile?.mkdirs()
+    if (tempFile.renameTo(destinationFile)) return true
+    // renameTo fails across filesystems — fall back to copy+delete.
+    // This is the slow path for large files and the root cause of the ANR,
+    // which is why it must run on Dispatchers.IO.
+    return try {
+      tempFile.copyTo(destinationFile, overwrite = true)
+      tempFile.delete()
+      true
+    } catch (e: Exception) {
+      logE(NAME, "Failed to move temp file to destination: ${e.message}")
+      false
+    }
+  }
 
+  private suspend fun onSuccessfulDownload(config: RNBGDTaskConfig, bytesDownloaded: Long, bytesTotal: Long) {
     val tempPath = configIdToTempPath.remove(config.id)
     val destinationFile = File(config.destination)
 
     if (tempPath != null && tempPath != config.destination) {
-      val tempFile = File(tempPath)
-      destinationFile.parentFile?.mkdirs()
-
-      val moved = tempFile.renameTo(destinationFile)
+      val moved = withContext(Dispatchers.IO) {
+        moveFile(File(tempPath), destinationFile)
+      }
       if (!moved) {
-        // renameTo fails across filesystems, fall back to copy+delete
-        try {
-          tempFile.copyTo(destinationFile, overwrite = true)
-          tempFile.delete()
-        } catch (e: Exception) {
-          logE(NAME, "Failed to move temp file to destination: ${e.message}")
-          eventEmitter.emitFailed(config.id, "Failed to move file to destination", -1)
-          return
-        }
+        eventEmitter.emitFailed(config.id, "Failed to move file to destination", -1)
+        return
       }
     }
 
     if (!destinationFile.exists()) {
       logE(NAME, "Downloaded file not found at destination: ${config.destination}")
-      val newDownloadStatus = Arguments.createMap()
-      newDownloadStatus.putString("downloadId", downloadStatus.getString("downloadId"))
-      newDownloadStatus.putInt("status", DownloadManager.STATUS_FAILED)
-      newDownloadStatus.putInt("reason", DownloadManager.ERROR_FILE_ERROR)
-      newDownloadStatus.putString("reasonText", "Downloaded file not found at destination")
-      onFailedDownload(config, newDownloadStatus)
+      onFailedDownload(config, null, DownloadManager.ERROR_FILE_ERROR, "Downloaded file not found at destination")
       return
     }
 
-    eventEmitter.emitComplete(
-      config.id,
-      config.destination,
-      downloadStatus.getDouble("bytesDownloaded").toLong(),
-      downloadStatus.getDouble("bytesTotal").toLong()
-    )
+    eventEmitter.emitComplete(config.id, config.destination, bytesDownloaded, bytesTotal)
   }
 
-  private fun onFailedDownload(config: RNBGDTaskConfig, downloadStatus: WritableMap) {
-    logE(
-      NAME, "onFailedDownload: " +
-          "${downloadStatus.getInt("status")}:" +
-          "${downloadStatus.getInt("reason")}:" +
-          downloadStatus.getString("reasonText")
-    )
+  private fun onFailedDownload(
+    config: RNBGDTaskConfig,
+    downloadIdStr: String?,
+    reason: Int,
+    reasonText: String?,
+    status: Int = DownloadManager.STATUS_FAILED
+  ) {
+    logE(NAME, "onFailedDownload: $status:$reason:$reasonText")
 
-    val reason = downloadStatus.getInt("reason")
-    var reasonText = downloadStatus.getString("reasonText")
+    var finalReasonText = reasonText
 
     // Enhanced handling for ERROR_CANNOT_RESUME (1008)
     if (reason == DownloadManager.ERROR_CANNOT_RESUME) {
       logW(
         NAME, "ERROR_CANNOT_RESUME detected for download: ${config.id}" +
-            ". This is a known Android DownloadManager issue with larger files. " +
-            "Consider restarting the download or using smaller file segments."
+                ". This is a known Android DownloadManager issue with larger files. " +
+                "Consider restarting the download or using smaller file segments."
       )
 
       // Clean up the failed download entry
-      removeTaskFromMap(downloadStatus.getString("downloadId")?.toLong() ?: 0L)
+      removeTaskFromMap(downloadIdStr?.toLong() ?: 0L)
 
       // Provide more helpful error message
-      reasonText =
+      finalReasonText =
         "ERROR_CANNOT_RESUME - Unable to resume download. This may occur with large files due to Android DownloadManager limitations. Try restarting the download."
     }
 
-    eventEmitter.emitFailed(config.id, reasonText ?: "Unknown error", reason)
+    eventEmitter.emitFailed(config.id, finalReasonText ?: "Unknown error", reason)
   }
 
   private fun saveDownloadIdToConfigMap() {
