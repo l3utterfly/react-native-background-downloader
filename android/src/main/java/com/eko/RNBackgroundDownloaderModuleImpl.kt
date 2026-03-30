@@ -398,17 +398,14 @@ class RNBackgroundDownloaderModuleImpl(private val reactContext: ReactApplicatio
 
         if (config != null) {
           val downloadStatus = downloader.checkDownloadStatus(downloadId)
-          val status = downloadStatus.getInt("status")
-          val localUri = downloadStatus.getString("localUri")
+          val status = if (downloadStatus.hasKey("status")) downloadStatus.getInt("status") else 0
+          val localUri = if (downloadStatus.hasKey("localUri")) downloadStatus.getString("localUri") else null
 
-          // Extract all values from WritableMap synchronously on the main thread,
-          // before any async handoff. WritableMap is not thread-safe and must not
-          // be read from a background coroutine.
-          val downloadIdStr = downloadStatus.getString("downloadId")
-          val bytesDownloaded = downloadStatus.getDouble("bytesDownloaded").toLong()
-          val bytesTotal = downloadStatus.getDouble("bytesTotal").toLong()
-          val reason = downloadStatus.getInt("reason")
-          val reasonText = downloadStatus.getString("reasonText")
+          val downloadIdStr = if (downloadStatus.hasKey("downloadId")) downloadStatus.getString("downloadId") else null
+          val bytesDownloaded = if (downloadStatus.hasKey("bytesDownloaded")) downloadStatus.getDouble("bytesDownloaded").toLong() else 0L
+          val bytesTotal = if (downloadStatus.hasKey("bytesTotal")) downloadStatus.getDouble("bytesTotal").toLong() else 0L
+          val reason = if (downloadStatus.hasKey("reason")) downloadStatus.getInt("reason") else 0
+          val reasonText = if (downloadStatus.hasKey("reasonText")) downloadStatus.getString("reasonText") else null
 
           stopTaskProgress(config.id)
 
